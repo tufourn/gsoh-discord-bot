@@ -1,6 +1,5 @@
 use poise::CreateReply;
 use poise::serenity_prelude::{self as serenity, Attachment, ChannelType, GetMessages, MessageId};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 use zip::ZipWriter;
@@ -13,7 +12,7 @@ type Context<'a> = poise::Context<'a, Data, Error>;
 
 const ALLOWED_CONTENT_TYPES: [&str; 2] = ["video/quicktime", "video/mp4"];
 const FILE_UPLOAD_URL: &str = "https://0x0.st";
-const MAX_TOTAL_SIZE_BYTES: u32 = 512 * 1024 * 1024; // 512MB
+const MAX_TOTAL_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
 const USER_AGENT: &str = "GsohDiscordBot/1.0 (https://github.com/tufourn/gsoh-discord-bot)";
 
 #[poise::command(slash_command)]
@@ -118,8 +117,6 @@ async fn pull(
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
-        let client = reqwest::blocking::Client::new();
-
         let mut total_size = 0;
         let mut message = None;
 
@@ -132,24 +129,23 @@ async fn pull(
                 None => continue,
             };
 
-            if total_size + submission.attachment.size > MAX_TOTAL_SIZE_BYTES {
+            if total_size + submission.attachment.size as u64 > MAX_TOTAL_SIZE_BYTES {
                 message = Some(format!(
                     "Size limit 512MB reached. Messages from {} and earlier were not downloaded",
                     submission.attachment.id.created_at()
                 ));
                 break;
             }
+            total_size += submission.attachment.size as u64;
 
             let new_file_name = format!(
                 "{}-{}-{}.{}",
                 &move_name, &submission.username, submission.attachment.id, file_extension
             );
 
-            let content = client.get(&submission.attachment.url).send()?.bytes()?;
-            total_size += submission.attachment.size;
-
+            let mut response = reqwest::blocking::get(&submission.attachment.url)?;
             zip.start_file(&new_file_name, options)?;
-            zip.write_all(&content)?;
+            std::io::copy(&mut response, &mut zip)?;
         }
 
         zip.finish()?;
@@ -161,12 +157,14 @@ async fn pull(
     })
     .await??;
 
-    ctx.send(CreateReply {
-        content: archive_result.message,
-        ephemeral: Some(true),
-        ..Default::default()
-    })
-    .await?;
+    if archive_result.message.is_some() {
+        ctx.send(CreateReply {
+            content: archive_result.message,
+            ephemeral: Some(true),
+            ..Default::default()
+        })
+        .await?;
+    }
 
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
     let form = reqwest::multipart::Form::new()
