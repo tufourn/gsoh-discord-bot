@@ -1,7 +1,5 @@
 use poise::CreateReply;
-use poise::serenity_prelude::{
-    self as serenity, Attachment, AttachmentId, ChannelType, GetMessages, MessageId, User,
-};
+use poise::serenity_prelude::{self as serenity, Attachment, ChannelType, GetMessages, MessageId};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
@@ -13,7 +11,7 @@ struct Data {
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
-const ALLOWED_CONTENT_TYPE: [&str; 2] = ["video/quicktime", "video/mp4"];
+const ALLOWED_CONTENT_TYPES: [&str; 2] = ["video/quicktime", "video/mp4"];
 const FILE_UPLOAD_URL: &str = "https://0x0.st";
 const MAX_TOTAL_SIZE_BYTES: u32 = 512 * 1024 * 1024; // 512MB
 const USER_AGENT: &str = "GsohDiscordBot/1.0 (https://github.com/tufourn/gsoh-discord-bot)";
@@ -61,16 +59,13 @@ async fn pull(
     }
 
     struct Submission {
-        id: AttachmentId,
         attachment: Attachment,
-        content: Vec<u8>,
-        user: User,
+        username: String,
     }
-
     let mut submissions: Vec<Submission> = Vec::new();
 
     let mut last_message_id: Option<MessageId> = None;
-    'outer: loop {
+    loop {
         let mut builder = GetMessages::new().limit(100);
         if let Some(id) = last_message_id {
             builder = builder.before(id);
@@ -82,49 +77,16 @@ async fn pull(
         }
 
         last_message_id = messages.last().map(|m| m.id);
-
-        let mut total_size: u32 = 0;
-
         for message in messages {
             for attachment in message.attachments {
                 if attachment
                     .content_type
                     .as_deref()
-                    .is_some_and(|ct| ALLOWED_CONTENT_TYPE.contains(&ct))
+                    .is_some_and(|ct| ALLOWED_CONTENT_TYPES.contains(&ct))
                 {
-                    if total_size + attachment.size > MAX_TOTAL_SIZE_BYTES {
-                        ctx.send(CreateReply {
-                            content: Some(format!(
-                                "Files exceed 512MB limit. Did not get videos from {} and earlier",
-                                message.timestamp
-                            )),
-                            ephemeral: Some(true),
-                            ..Default::default()
-                        })
-                        .await?;
-                        break 'outer;
-                    }
-
-                    let content = match attachment.download().await {
-                        Ok(content) => content,
-                        Err(e) => {
-                            ctx.send(CreateReply {
-                                content: Some(format!("Error downloading attachment: {:?}", e)),
-                                ephemeral: Some(true),
-                                ..Default::default()
-                            })
-                            .await?;
-                            continue;
-                        }
-                    };
-
-                    total_size += attachment.size;
-
                     submissions.push(Submission {
-                        id: attachment.id,
                         attachment,
-                        content,
-                        user: message.author.to_owned(),
+                        username: message.author.name.to_owned(),
                     });
                 }
             }
@@ -145,11 +107,21 @@ async fn pull(
     let zip_file_name = format!("{}.zip", &move_name);
     let zip_file_path = dir.path().join(&zip_file_name);
 
-    let archive = tokio::task::spawn_blocking(move || {
+    struct ArchiveResult {
+        archive: PathBuf,
+        message: Option<String>,
+    }
+
+    let archive_result = tokio::task::spawn_blocking(move || {
         let zip_file = std::fs::File::create(&zip_file_path)?;
         let mut zip = ZipWriter::new(zip_file);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
+
+        let client = reqwest::blocking::Client::new();
+
+        let mut total_size = 0;
+        let mut message = None;
 
         for submission in submissions {
             let file_extension = match Path::new(&submission.attachment.filename)
@@ -159,25 +131,47 @@ async fn pull(
                 Some(ext) => ext,
                 None => continue,
             };
+
+            if total_size + submission.attachment.size > MAX_TOTAL_SIZE_BYTES {
+                message = Some(format!(
+                    "Size limit 512MB reached. Messages from {} and earlier were not downloaded",
+                    submission.attachment.id.created_at()
+                ));
+                break;
+            }
+
             let new_file_name = format!(
                 "{}-{}-{}.{}",
-                &move_name, submission.user.name, submission.id, file_extension
+                &move_name, &submission.username, submission.attachment.id, file_extension
             );
 
+            let content = client.get(&submission.attachment.url).send()?.bytes()?;
+            total_size += submission.attachment.size;
+
             zip.start_file(&new_file_name, options)?;
-            zip.write_all(&submission.content)?;
+            zip.write_all(&content)?;
         }
 
         zip.finish()?;
 
-        Ok::<PathBuf, Error>(zip_file_path)
+        Ok::<ArchiveResult, Error>(ArchiveResult {
+            archive: zip_file_path,
+            message,
+        })
     })
     .await??;
 
+    ctx.send(CreateReply {
+        content: archive_result.message,
+        ephemeral: Some(true),
+        ..Default::default()
+    })
+    .await?;
+
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
     let form = reqwest::multipart::Form::new()
-        .text("expires", "1") // set expires to 1 hour
-        .file(zip_file_name.to_owned(), archive)
+        .text("expires", "1") // download link expires in 1 hour
+        .file("file", archive_result.archive)
         .await?;
 
     let download_link = client
@@ -246,6 +240,8 @@ async fn search(
 #[tokio::main]
 async fn main() {
     dotenvy::dotenv().ok();
+
+    tracing_subscriber::fmt::init();
 
     let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
     let intents =
