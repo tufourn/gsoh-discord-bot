@@ -1,24 +1,22 @@
-use curl::easy::{Easy, Form};
 use poise::CreateReply;
 use poise::serenity_prelude::{
-    self as serenity, Attachment, AttachmentId, GetMessages, MessageId, User,
+    self as serenity, Attachment, AttachmentId, ChannelType, GetMessages, MessageId, User,
 };
-use std::ffi::OsStr;
 use std::io::Write;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 use zip::ZipWriter;
-use zip::write::SimpleFileOptions;
 
 struct Data {
     move_list: Vec<&'static str>,
-    curl_handle: Arc<tokio::sync::Mutex<Easy>>,
 }
 type Error = Box<dyn std::error::Error + Send + Sync>;
 type Context<'a> = poise::Context<'a, Data, Error>;
 
 const ALLOWED_CONTENT_TYPE: [&str; 2] = ["video/quicktime", "video/mp4"];
+const FILE_UPLOAD_URL: &str = "https://0x0.st";
+const MAX_TOTAL_SIZE_BYTES: u32 = 512 * 1024 * 1024; // 512MB
+const USER_AGENT: &str = "GsohDiscordBot/1.0 (https://github.com/tufourn/gsoh-discord-bot)";
 
 #[poise::command(slash_command)]
 async fn pull(
@@ -28,9 +26,7 @@ async fn pull(
     ctx.defer_ephemeral().await?;
     let guild_channel = match ctx.guild_channel().await {
         Some(gc) => match gc.kind {
-            serenity::ChannelType::NewsThread
-            | serenity::ChannelType::PublicThread
-            | serenity::ChannelType::PrivateThread => gc,
+            ChannelType::NewsThread | ChannelType::PublicThread | ChannelType::PrivateThread => gc,
             _ => {
                 ctx.send(CreateReply {
                     content: Some("This command must be run in a thread".to_owned()),
@@ -64,10 +60,17 @@ async fn pull(
         return Ok(());
     }
 
-    let mut all_messages = Vec::new();
-    let mut last_message_id: Option<MessageId> = None;
+    struct Submission {
+        id: AttachmentId,
+        attachment: Attachment,
+        content: Vec<u8>,
+        user: User,
+    }
 
-    loop {
+    let mut submissions: Vec<Submission> = Vec::new();
+
+    let mut last_message_id: Option<MessageId> = None;
+    'outer: loop {
         let mut builder = GetMessages::new().limit(100);
         if let Some(id) = last_message_id {
             builder = builder.before(id);
@@ -79,45 +82,51 @@ async fn pull(
         }
 
         last_message_id = messages.last().map(|m| m.id);
-        all_messages.extend(messages);
 
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
+        let mut total_size: u32 = 0;
 
-    struct Submission {
-        id: AttachmentId,
-        attachment: Attachment,
-        content: Vec<u8>,
-        user: User,
-    }
-
-    let mut submissions: Vec<Submission> = Vec::new();
-    for message in all_messages {
-        for attachment in message.attachments {
-            if attachment
-                .content_type
-                .as_deref()
-                .is_some_and(|ct| ALLOWED_CONTENT_TYPE.contains(&ct))
-            {
-                let content = match attachment.download().await {
-                    Ok(content) => content,
-                    Err(e) => {
+        for message in messages {
+            for attachment in message.attachments {
+                if attachment
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|ct| ALLOWED_CONTENT_TYPE.contains(&ct))
+                {
+                    if total_size + attachment.size > MAX_TOTAL_SIZE_BYTES {
                         ctx.send(CreateReply {
-                            content: Some(format!("Error downloading attachment: {:?}", e)),
+                            content: Some(format!(
+                                "Files exceed 512MB limit. Did not get videos from {} and earlier",
+                                message.timestamp
+                            )),
                             ephemeral: Some(true),
                             ..Default::default()
                         })
                         .await?;
-                        continue;
+                        break 'outer;
                     }
-                };
 
-                submissions.push(Submission {
-                    id: attachment.id,
-                    attachment,
-                    content,
-                    user: message.author.clone(),
-                });
+                    let content = match attachment.download().await {
+                        Ok(content) => content,
+                        Err(e) => {
+                            ctx.send(CreateReply {
+                                content: Some(format!("Error downloading attachment: {:?}", e)),
+                                ephemeral: Some(true),
+                                ..Default::default()
+                            })
+                            .await?;
+                            continue;
+                        }
+                    };
+
+                    total_size += attachment.size;
+
+                    submissions.push(Submission {
+                        id: attachment.id,
+                        attachment,
+                        content,
+                        user: message.author.to_owned(),
+                    });
+                }
             }
         }
     }
@@ -132,28 +141,27 @@ async fn pull(
         return Ok(());
     }
 
-    let curl_handle_arc = ctx.data().curl_handle.clone();
-    let move_name_clone = move_name.clone();
+    let dir = tempdir()?;
+    let zip_file_name = format!("{}.zip", &move_name);
+    let zip_file_path = dir.path().join(&zip_file_name);
 
-    let zip_and_upload: Result<String, Error> = tokio::task::spawn_blocking(move || {
-        let dir = tempdir()?;
-        let zip_file_path = dir.path().join(format!("{}.zip", &move_name_clone));
+    let archive = tokio::task::spawn_blocking(move || {
         let zip_file = std::fs::File::create(&zip_file_path)?;
         let mut zip = ZipWriter::new(zip_file);
-        let options =
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
 
         for submission in submissions {
             let file_extension = match Path::new(&submission.attachment.filename)
                 .extension()
-                .and_then(OsStr::to_str)
+                .and_then(std::ffi::OsStr::to_str)
             {
                 Some(ext) => ext,
                 None => continue,
             };
             let new_file_name = format!(
                 "{}-{}-{}.{}",
-                &move_name_clone, submission.user.name, submission.id, file_extension
+                &move_name, submission.user.name, submission.id, file_extension
             );
 
             zip.start_file(&new_file_name, options)?;
@@ -162,45 +170,40 @@ async fn pull(
 
         zip.finish()?;
 
-        let mut easy_handle = curl_handle_arc.blocking_lock();
-        easy_handle.reset();
-        let mut form = Form::new();
-        form.part("file").file(&zip_file_path).add()?;
-        form.part("expires").contents(b"1").add()?;
-        easy_handle.url("https://0x0.st")?;
-        easy_handle.useragent("curl/7.54.1")?;
-        easy_handle.httppost(form)?;
-        let mut response_body = Vec::new();
-        {
-            let mut transfer = easy_handle.transfer();
-            transfer.write_function(|data| {
-                response_body.extend_from_slice(data);
-                Ok(data.len())
-            })?;
-            transfer.perform()?;
-        }
-
-        let response_str = String::from_utf8(response_body)?;
-
-        dir.close()?;
-        Ok(response_str)
+        Ok::<PathBuf, Error>(zip_file_path)
     })
-    .await?;
+    .await??;
 
-    let response = match zip_and_upload {
-        Ok(download_link) => format!(
-            "{}/{}.zip\nLink expires in 1 hour",
-            &download_link.trim(),
-            &move_name
-        ),
-        Err(_) => "Failed to generate download link".to_owned(),
-    };
+    let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
+    let form = reqwest::multipart::Form::new()
+        .text("expires", "1") // set expires to 1 hour
+        .file(zip_file_name.to_owned(), archive)
+        .await?;
+
+    let download_link = client
+        .post(FILE_UPLOAD_URL)
+        .multipart(form)
+        .send()
+        .await?
+        .text()
+        .await?;
+
+    // 0x0.st renames the uploaded file
+    // append zip file name to download url to get correct filename
+    let reply = format!(
+        "{}/{}\nLink expires in 1 hour",
+        &download_link.trim(),
+        zip_file_name
+    );
+
     ctx.send(CreateReply {
-        content: Some(response),
+        content: Some(reply),
         ephemeral: Some(true),
         ..Default::default()
     })
     .await?;
+
+    dir.close()?;
 
     Ok(())
 }
@@ -210,8 +213,6 @@ async fn search(
     ctx: Context<'_>,
     #[description = "Search term"] search_term: String,
 ) -> Result<(), Error> {
-    ctx.defer_ephemeral().await?;
-
     let search_term = search_term.to_lowercase();
 
     let results: Vec<&'static str> = ctx
@@ -251,7 +252,6 @@ async fn main() {
         serenity::GatewayIntents::non_privileged() | serenity::GatewayIntents::MESSAGE_CONTENT;
 
     let move_list: Vec<&'static str> = include_str!("../move-list.txt").lines().collect();
-    let curl_handle = Arc::new(tokio::sync::Mutex::new(Easy::new()));
 
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
@@ -261,10 +261,7 @@ async fn main() {
         .setup(|ctx, _ready, framework| {
             Box::pin(async move {
                 poise::builtins::register_globally(ctx, &framework.options().commands).await?;
-                Ok(Data {
-                    move_list,
-                    curl_handle,
-                })
+                Ok(Data { move_list })
             })
         })
         .build();
@@ -272,5 +269,6 @@ async fn main() {
     let client = serenity::ClientBuilder::new(token, intents)
         .framework(framework)
         .await;
+
     client.unwrap().start().await.unwrap();
 }
