@@ -1,8 +1,10 @@
+use anyhow::Context as AnyhowContext;
 use poise::CreateReply;
 use poise::serenity_prelude::{self as serenity, Attachment, ChannelType, GetMessages, MessageId};
 use std::path::{Path, PathBuf};
-use tempfile::tempdir;
-use zip::ZipWriter;
+use tracing::instrument;
+use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+use validator::ValidateUrl;
 
 struct Data {
     move_list: Vec<&'static str>,
@@ -16,11 +18,15 @@ const MAX_TOTAL_SIZE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
 const USER_AGENT: &str = "GsohDiscordBot/1.0 (https://github.com/tufourn/gsoh-discord-bot)";
 
 #[poise::command(slash_command)]
+#[instrument(name = "pull", skip_all, fields(id = ctx.id(), username = ctx.author().name, move_name = move_name))]
 async fn pull(
     ctx: Context<'_>,
     #[description = "Move name"] move_name: String,
 ) -> Result<(), Error> {
-    ctx.defer_ephemeral().await?;
+    ctx.defer_ephemeral()
+        .await
+        .context("Failed to defer response")?;
+
     let guild_channel = match ctx.guild_channel().await {
         Some(gc) => match gc.kind {
             ChannelType::NewsThread | ChannelType::PublicThread | ChannelType::PrivateThread => gc,
@@ -30,7 +36,8 @@ async fn pull(
                     ephemeral: Some(true),
                     ..Default::default()
                 })
-                .await?;
+                .await
+                .context("Failed to send message")?;
                 return Ok(());
             }
         },
@@ -40,7 +47,8 @@ async fn pull(
                 ephemeral: Some(true),
                 ..Default::default()
             })
-            .await?;
+            .await
+            .context("Failed to send message")?;
             return Ok(());
         }
     };
@@ -53,7 +61,8 @@ async fn pull(
             ephemeral: Some(true),
             ..Default::default()
         })
-        .await?;
+        .await
+        .context("Failed to send message")?;
         return Ok(());
     }
 
@@ -70,7 +79,11 @@ async fn pull(
             builder = builder.before(id);
         }
 
-        let messages = guild_channel.id.messages(&ctx, builder).await?;
+        let messages = guild_channel
+            .id
+            .messages(&ctx, builder)
+            .await
+            .context("Failed to retrieve messages")?;
         if messages.is_empty() {
             break;
         }
@@ -98,11 +111,12 @@ async fn pull(
             ephemeral: Some(true),
             ..Default::default()
         })
-        .await?;
+        .await
+        .context("Failed to send message")?;
         return Ok(());
     }
 
-    let dir = tempdir()?;
+    let dir = tempfile::tempdir().context("Failed to create temporary directory")?;
     let zip_file_name = format!("{}.zip", &move_name);
     let zip_file_path = dir.path().join(&zip_file_name);
 
@@ -112,8 +126,8 @@ async fn pull(
     }
 
     let archive_result = tokio::task::spawn_blocking(move || {
-        let zip_file = std::fs::File::create(&zip_file_path)?;
-        let mut zip = ZipWriter::new(zip_file);
+        let zip_file = std::fs::File::create(&zip_file_path).context("Failed to create archive")?;
+        let mut zip = zip::ZipWriter::new(zip_file);
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
 
@@ -143,19 +157,28 @@ async fn pull(
                 &move_name, &submission.username, submission.attachment.id, file_extension
             );
 
-            let mut response = reqwest::blocking::get(&submission.attachment.url)?;
-            zip.start_file(&new_file_name, options)?;
-            std::io::copy(&mut response, &mut zip)?;
+            let mut response = reqwest::blocking::get(&submission.attachment.url)
+                .context("Failed to get attachment")?;
+            zip.start_file(&new_file_name, options).context(format!(
+                "Failed to start writing attachment {}",
+                submission.attachment.id,
+            ))?;
+            std::io::copy(&mut response, &mut zip).context(format!(
+                "Failed to write attachment {}",
+                submission.attachment.id
+            ))?;
         }
 
-        zip.finish()?;
+        zip.finish()
+            .context("Failed to finish writing to archive")?;
 
         Ok::<ArchiveResult, Error>(ArchiveResult {
             archive: zip_file_path,
             message,
         })
     })
-    .await??;
+    .await
+    .context("Failed to create archive")??;
 
     if archive_result.message.is_some() {
         ctx.send(CreateReply {
@@ -163,44 +186,56 @@ async fn pull(
             ephemeral: Some(true),
             ..Default::default()
         })
-        .await?;
+        .await
+        .context("Failed to send message")?;
     }
 
     let client = reqwest::Client::builder().user_agent(USER_AGENT).build()?;
     let form = reqwest::multipart::Form::new()
         .text("expires", "1") // download link expires in 1 hour
         .file("file", archive_result.archive)
-        .await?;
+        .await
+        .context("Failed to create upload form")?;
 
-    let download_link = client
+    let response = client
         .post(FILE_UPLOAD_URL)
         .multipart(form)
         .send()
-        .await?
+        .await
+        .context("Failed to send request")?
         .text()
-        .await?;
+        .await
+        .context("Failed to get response text")?;
 
-    // 0x0.st renames the uploaded file
-    // append zip file name to download url to get correct filename
-    let reply = format!(
-        "{}/{}\nLink expires in 1 hour",
-        &download_link.trim(),
-        zip_file_name
-    );
+    let reply = if response.validate_url() {
+        // 0x0.st renames the uploaded file
+        // append zip filename to download url to get correct filename
+        format!(
+            "{}/{}\nLink expires in 1 hour",
+            &response.trim(),
+            zip_file_name
+        )
+    } else {
+        tracing::error!("Failed to create download link. Response:\n{}", response);
+        "Failed to create download link".to_string()
+    };
 
     ctx.send(CreateReply {
         content: Some(reply),
         ephemeral: Some(true),
         ..Default::default()
     })
-    .await?;
+    .await
+    .context("Failed to send message")?;
 
-    dir.close()?;
+    dir.close()
+        .context("Failed to close and remove temporary directory")?;
 
     Ok(())
 }
 
 #[poise::command(slash_command)]
+#[instrument(name = "search", skip_all, fields(id = ctx.id(), username = ctx.author().name, search_term = search_term))]
 async fn search(
     ctx: Context<'_>,
     #[description = "Search term"] search_term: String,
@@ -215,7 +250,7 @@ async fn search(
         .cloned()
         .collect();
 
-    let response = if results.is_empty() {
+    let reply = if results.is_empty() {
         format!("No move contains {}", search_term)
     } else {
         format!(
@@ -226,11 +261,12 @@ async fn search(
     };
 
     ctx.send(CreateReply {
-        content: Some(response),
+        content: Some(reply),
         ephemeral: Some(true),
         ..Default::default()
     })
-    .await?;
+    .await
+    .context("Failed to send message")?;
 
     Ok(())
 }
@@ -239,7 +275,13 @@ async fn search(
 async fn main() {
     dotenvy::dotenv().ok();
 
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "info,serenity=error".into()),
+        )
+        .with(tracing_subscriber::fmt::layer().with_span_events(FmtSpan::NEW | FmtSpan::CLOSE))
+        .init();
 
     let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
     let intents =

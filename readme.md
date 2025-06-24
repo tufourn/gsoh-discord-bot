@@ -2,7 +2,9 @@
 
 Makes it easier to download videos from threads in the Gambling Sleight of Hand (GSOH) Discord server.
 
-This bot uses [`serenity`](https://crates.io/crates/serenity) and [`poise`](https://crates.io/crates/poise) to download videos from threads, uses [`zip`](https://crates.io/crates/zip) to compress them into an archive, and then uploads the archive via [`reqwest`](https://crates.io/crates/reqwest) to [`0x0.st`](https://0x0.st) to obtain a temporary download link that expires in 1 hour to avoid overloading the file hosting server.
+This bot uses [`serenity`](https://crates.io/crates/serenity) and [`poise`](https://crates.io/crates/poise) to download videos from threads, uses [`zip`](https://crates.io/crates/zip) to compress them into an archive, and then uploads the archive via [`reqwest`](https://crates.io/crates/reqwest) to [`0x0.st`](https://0x0.st) to obtain a temporary download link.
+
+The download link expires in 1 hour to avoid overloading the file hosting server.
 
 ### Usage
 
@@ -12,7 +14,7 @@ This bot uses [`serenity`](https://crates.io/crates/serenity) and [`poise`](http
 | `/search <search_term>` | Searches the bot's move list (stored in `move-list.txt`) for finding the exact `move_name` to use with the `/pull` command. Using the page number as a `search_term` often yields the best results. |
 
 #### Example usage
-In the `Conley Three-Riffle Variation` thread, do `/search 107`. The bot responds with:
+In the `Conley Three-Riffle Variation (Page 107)` thread, do `/search 107`. The bot responds with:
 ```
 Moves containing "107":
 02-false_shuffles-0107-conleys_three_riffle_variation
